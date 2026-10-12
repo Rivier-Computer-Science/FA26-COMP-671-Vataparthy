@@ -200,5 +200,143 @@ def make_benchmark(test):
     return benchmark, labels
 
 
+# 5. MODEL SCORES AND AUTOENCODER TRAINING
+def anomaly_scores(model, values):
+    # Score already-scaled rows using a fitted model; larger means more unusual.
+    # Isolation Forest uses its reversed native score. PCA and the autoencoder
+    # use mean squared reconstruction error across features. Return one score
+    # per row; these scores are not probabilities or directly comparable across models.
+
+    if isinstance(model, IsolationForest):
+        return -model.score_samples(values)  # Higher means more unusual.
+    if isinstance(model, PCA):
+        # Compress to principal components, then reconstruct the original features.
+        reconstructed = model.inverse_transform(model.transform(values))
+        return ((values - reconstructed) ** 2).mean(axis=1)
+    # Inference needs predictions only; no gradients or weight updates are needed.
+    model.eval()
+    with torch.no_grad():
+        x = torch.tensor(values, dtype=torch.float32)
+        return ((model(x) - x) ** 2).mean(dim=1).numpy()
+
+
+def train_autoencoder(train, validation, seed):
+    # Train a small CPU autoencoder to reconstruct scaled training features.
+    # Use MSE loss, Adam, and backpropagation; check separate validation data
+    # after every epoch. Return the weights with the lowest accepted validation
+    # error, rather than automatically returning the final epoch's weights.
+
+    # Control the random starting weights and shuffled training batches.
+    torch.manual_seed(seed)
+    size = train.shape[1]
+    # Encoder: input -> 16 -> 4; decoder: 4 -> 16 -> input size.
+    # The four-value bottleneck compresses patterns; ReLU allows nonlinear learning.
+    model = nn.Sequential(nn.Linear(size, 16), nn.ReLU(), nn.Linear(16, 4),
+                          nn.ReLU(), nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, size))
+    optimizer = torch.optim.Adam(model.parameters(), lr=.001)
+    x = torch.tensor(train, dtype=torch.float32)
+    best_loss, best_weights, patience = float("inf"), None, 0
+    for epoch in range(EPOCHS):
+        model.train()
+        # Shuffle rows each epoch and process batches of at most 256 purchases.
+        for indices in torch.randperm(len(x)).split(256):
+            batch = x[indices]
+            # The target is the input itself: no anomaly labels are used for training.
+            loss = ((model(batch) - batch) ** 2).mean()
+            # Clear old gradients, calculate new gradients, then update weights.
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        # Validation is scored without updating weights; test data are not used here.
+        validation_loss = float(anomaly_scores(model, validation).mean())
+        # Require improvement greater than 0.00001 and copy the best weights.
+        if validation_loss < best_loss - .00001:
+            best_loss, best_weights, patience = validation_loss, deepcopy(model.state_dict()), 0
+        else:
+            patience += 1
+        # Stop after 10 consecutive epochs without sufficient validation improvement.
+        # An improvement resets the counter; EPOCHS still limits total training.
+        if patience >= 10:
+            break
+    if best_weights is None:
+        raise ValueError("Training failed to produce a valid checkpoint.")
+    # Restore the saved checkpoint even if the last epoch was worse.
+    model.load_state_dict(best_weights)
+    print(f"  Autoencoder: {epoch + 1} epochs; best validation MSE = {best_loss:.4f}")
+    return model
+
+
+# 6. EVALUATE ALL MODELS ON EXACTLY THE SAME HELD-OUT BENCHMARK
+def run_experiment(orders):
+    # Compare Isolation Forest, PCA, and an autoencoder on the same benchmark,
+    # first with transaction features and then with added customer history.
+    # Print evaluation scores, variation across seeds, and orders for review.
+    # Return the first-seed customer autoencoder, its scaler, and its threshold
+    # for the optional prediction demo; test scores do not choose this model.
+
+    train, validation, calibration, test = split_data(orders)
+    benchmark, labels = make_benchmark(test)
+    results, demo = [], None
+    # Controlled comparison: use the same splits, benchmark, and training settings.
+    # The feature switch changes whether customer history is available.
+    for use_history in [False, True]:
+        feature_set = "Customer" if use_history else "Transaction"
+        # Fit scaling on training data only, then reuse it everywhere else.
+        scaler = StandardScaler().fit(make_features(train, use_history))
+        x_train, x_val, x_cal, x_test = [scaler.transform(make_features(part, use_history)).astype("float32")
+                                      for part in [train, validation, calibration, benchmark]]
+        # Same four-dimensional bottleneck as the autoencoder; full PCA is deterministic.
+        pca = PCA(n_components=4, svd_solver="full").fit(x_train)
+        # Repeat the random models; PCA has no seed variation with this solver.
+        for seed in SEEDS:
+            print(f"Training {feature_set} models, seed {seed}...")
+            baseline = IsolationForest(n_estimators=100, random_state=seed, n_jobs=2).fit(x_train)
+            autoencoder = train_autoencoder(x_train, x_val, seed)
+            models = [("Isolation Forest", baseline), ("Autoencoder", autoencoder)]
+            if seed == SEEDS[0]:
+                models.append(("PCA", pca))  # Evaluate deterministic PCA only once.
+            for name, model in models:
+                # Calibration is separate from early stopping and final testing.
+                # The 98th percentile targets roughly the highest-scoring 2% of
+                # calibration orders; it does not guarantee a 2% test alert rate.
+                threshold = float(np.quantile(anomaly_scores(model, x_cal), .98))
+                scores = anomaly_scores(model, x_test)
+                predicted = scores > threshold
+                # Precision: detected injected anomalies / all flagged benchmark rows.
+                # Recall: detected / all injected anomalies; F1 balances both measures.
+                # ROC-AUC and average precision summarize ranking across thresholds.
+                # OriginalAlertRate is not a verified false-positive rate.
+                result = {"Features": feature_set, "Model": name, "Seed": "fixed" if name == "PCA" else seed,
+                          "Precision": precision_score(labels, predicted, zero_division=0),
+                          "Recall": recall_score(labels, predicted, zero_division=0),
+                          "F1": f1_score(labels, predicted, zero_division=0),
+                          "ROC_AUC": roc_auc_score(labels, scores),
+                          "AvgPrecision": average_precision_score(labels, scores),
+                          "OriginalAlertRate": predicted[labels == 0].mean()}
+                # Isolation Forest does not reconstruct inputs, so its MSE is N/A.
+                for label, title in [(0, "OriginalMSE"), (1, "SyntheticMSE")]:
+                    result[title] = scores[labels == label].mean() if name != "Isolation Forest" else np.nan
+                # Per-type recall shows which injected behaviors are easier to detect.
+                for kind in ["bulk", "high_value", "customer_shift"]:
+                    mask = benchmark["kind"].eq(kind).to_numpy()
+                    result[kind + "_recall"] = predicted[mask].mean() if mask.any() else np.nan
+                results.append(result)
+                if use_history and seed == SEEDS[0] and name == "Autoencoder":
+                    demo = (model, scaler, threshold)  # Fixed choice, not the best test score.
+                    review = test[["customer", "date", "value"]].copy()
+                    review["score"] = scores[:len(test)]
+    print("\nSYNTHETIC BENCHMARK: original orders are assumed negatives, not verified normal orders.")
+    print("Recall is the synthetic anomaly detection rate. MSE applies only to PCA/autoencoders.")
+    table = pd.DataFrame(results)
+    print(table.round(4).to_string(index=False))
+    print("\nMean and standard deviation across training seeds (PCA runs once):")
+    # PCA's standard deviation is NaN because it has only one result per feature set.
+    # A sample standard deviation requires at least two results.
+    print(table.groupby(["Features", "Model"])[["F1", "AvgPrecision"]].agg(["mean", "std"]).round(4))
+    print("\nHighest-scoring original orders for human review (not confirmed false positives):")
+    print(review.nlargest(5, "score").to_string(index=False))
+    return demo
+
+
 if __name__ == "__main__":
     main()
