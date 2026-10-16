@@ -338,5 +338,37 @@ def run_experiment(orders):
     return demo
 
 
+# 7. USE THE TRAINED CUSTOMER AUTOENCODER ON A NEW ORDER
+def predict_order(events, bundle, customer, value, quantity, products, date):
+    # Check one manually entered positive purchase using the trained customer
+    # autoencoder and that customer's earlier history. Print its score and
+    # threshold-based decision, then return the score. This demonstration does
+    # not retrain the model, update stored history, or change evaluation results.
+
+    # Reject missing/infinite values, nonpositive amounts, and impossible item counts.
+    if not all(np.isfinite([value, quantity, products])) or min(value, quantity, products) <= 0:
+        raise ValueError("Enter positive, finite numbers.")
+    if quantity % 1 or products % 1 or products > quantity:
+        raise ValueError("Counts must be whole numbers, with products <= quantity.")
+    # Requiring a date after all observed events keeps every history record in the past.
+    date = pd.Timestamp(date)
+    if pd.isna(date) or date.tzinfo is not None or date <= events["date"].max():
+        raise ValueError("Use a timezone-free date after the last observed event.")
+    # A new customer has an empty history; add_history() supplies zero placeholders.
+    past = events.loc[events["customer"].eq(customer)]
+    new_order = pd.DataFrame([{"customer": customer, "value": value, "quantity": quantity,
+                               "products": products, "date": date, "is_cancel": False}])
+    # Reuse exactly the same history calculation as training, including cancellations.
+    prepared = add_history(pd.concat([past, new_order], ignore_index=True)).tail(1)
+    model, scaler, threshold = bundle
+    # Apply the training scaler as-is; fitting a new scaler would change score meaning.
+    features = scaler.transform(make_features(prepared, True)).astype("float32")
+    score = float(anomaly_scores(model, features)[0])
+    # This is raw reconstruction MSE, not a percentage or probability of fraud.
+    print(f"Score: {score:.4f} | Threshold: {threshold:.4f}")
+    print(prepared[["previous_orders", "purchases_30d", "days_since_purchase", "cancellation_rate"]].to_string(index=False))
+    print("Unusual: review this order." if score > threshold else "Within the learned range.")
+    return score
+
 if __name__ == "__main__":
     main()
