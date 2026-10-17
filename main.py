@@ -370,5 +370,43 @@ def predict_order(events, bundle, customer, value, quantity, products, date):
     print("Unusual: review this order." if score > threshold else "Within the learned range.")
     return score
 
+# 8. MAIN PROGRAM: PREPARE -> TRAIN -> EVALUATE -> PREDICT
+def main():
+    # Run the whole program: locate the dataset, clean it, prepare customer
+    # history, train/evaluate the models, and offer one optional prediction.
+    # Models stay in memory for this run; running the script again retrains them.
+
+    # Locate the workbook beside this script, accepting either supported filename.
+    folder = Path(__file__).resolve().parent
+    path = folder / "Online Retail.xlsx"
+    if not path.exists():
+        path = folder / "Online_Retail.xlsx"
+    if not path.exists():
+        print("Place Online Retail.xlsx in the same folder as main.py.")
+        return
+    # Loading the large Excel workbook can take time before the first message appears.
+    events = load_events(path)
+    # Earlier original test events may update later history, as in chronological deployment.
+    orders = add_history(events)
+    bundle = run_experiment(orders)
+    print(f"\nPrediction demo: use a date after {events.date.max()}.")
+    print(f"Example known customer: {orders.iloc[-1]['customer']}")
+    # Evaluation is already complete. User input is only for the prediction demo;
+    # press Enter at the customer prompt to finish without supplying an order.
+    try:
+        customer = input("Customer ID (press Enter to finish): ").strip()
+        if customer:
+            value = float(input("Order value in GBP: "))
+            quantity = float(input("Total item quantity: "))
+            products = float(input("Number of distinct products: "))
+            date = input("Order date and time (YYYY-MM-DD HH:MM): ")
+            predict_order(events, bundle, customer, value, quantity, products, date)
+    except ValueError as error:
+        print(f"Prediction not completed: {error}")
+    except EOFError:
+        pass  # Allows running the experiment without interactive input.
+
+
+# Start the workflow when this file is run directly, not when its functions are imported.
 if __name__ == "__main__":
     main()
