@@ -1,0 +1,10 @@
+# Direct dependencies used by the single-file main.py implementation.
+# This is an initial installation list, not the original run's version snapshot.
+# Generate requirements-lock.txt from your successful environment as explained
+# in REPRODUCIBILITY.md. Exact versions were not supplied with the original output.
+# On Windows/Linux, README.md installs a CPU PyTorch wheel before this file.
+numpy
+pandas
+openpyxl
+scikit-learn
+torch
